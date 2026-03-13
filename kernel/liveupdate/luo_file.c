@@ -292,7 +292,8 @@ int luo_preserve_file(struct luo_file_set *file_set, u64 token, int fd)
 	down_read(&luo_register_rwlock);
 	list_private_for_each_entry(fh, &luo_file_handler_list, list) {
 		if (fh->ops->can_preserve(fh, file)) {
-			err = 0;
+			if (try_module_get(fh->ops->owner))
+				err = 0;
 			break;
 		}
 	}
@@ -306,7 +307,7 @@ int luo_preserve_file(struct luo_file_set *file_set, u64 token, int fd)
 	err = xa_insert(&luo_preserved_files, luo_get_id(fh, file),
 			file, GFP_KERNEL);
 	if (err)
-		goto err_free_files_mem;
+		goto err_module_put;
 
 	err = luo_flb_file_preserve(fh);
 	if (err)
@@ -342,6 +343,8 @@ err_flb_unpreserve:
 	luo_flb_file_unpreserve(fh);
 err_erase_xa:
 	xa_erase(&luo_preserved_files, luo_get_id(fh, file));
+err_module_put:
+	module_put(fh->ops->owner);
 err_free_files_mem:
 	luo_free_files_mem(file_set);
 err_fput:
@@ -384,6 +387,7 @@ void luo_file_unpreserve_files(struct luo_file_set *file_set)
 		args.private_data = luo_file->private_data;
 		luo_file->fh->ops->unpreserve(&args);
 		luo_flb_file_unpreserve(luo_file->fh);
+		module_put(luo_file->fh->ops->owner);
 
 		xa_erase(&luo_preserved_files,
 			 luo_get_id(luo_file->fh, luo_file->file));
@@ -675,6 +679,7 @@ static void luo_file_finish_one(struct luo_file_set *file_set,
 
 	luo_file->fh->ops->finish(&args);
 	luo_flb_file_finish(luo_file->fh);
+	module_put(luo_file->fh->ops->owner);
 }
 
 /**
@@ -812,7 +817,8 @@ int luo_file_deserialize(struct luo_file_set *file_set,
 		down_read(&luo_register_rwlock);
 		list_private_for_each_entry(fh, &luo_file_handler_list, list) {
 			if (!strcmp(fh->compatible, file_ser[i].compatible)) {
-				handler_found = true;
+				if (try_module_get(fh->ops->owner))
+					handler_found = true;
 				break;
 			}
 		}
@@ -826,8 +832,10 @@ int luo_file_deserialize(struct luo_file_set *file_set,
 		}
 
 		luo_file = kzalloc_obj(*luo_file);
-		if (!luo_file)
+		if (!luo_file) {
+			module_put(fh->ops->owner);
 			return -ENOMEM;
+		}
 
 		/* safe to use fh because its module is pinned */
 		luo_file->fh = fh;
@@ -889,12 +897,6 @@ int liveupdate_register_file_handler(struct liveupdate_file_handler *fh)
 		}
 	}
 
-	/* Pin the module implementing the handler */
-	if (!try_module_get(fh->ops->owner)) {
-		err = -EAGAIN;
-		goto err_unlock;
-	}
-
 	INIT_LIST_HEAD(&ACCESS_PRIVATE(fh, flb_list));
 	INIT_LIST_HEAD(&ACCESS_PRIVATE(fh, list));
 	list_add_tail(&ACCESS_PRIVATE(fh, list), &luo_file_handler_list);
@@ -924,6 +926,4 @@ void liveupdate_unregister_file_handler(struct liveupdate_file_handler *fh)
 	guard(rwsem_write)(&luo_register_rwlock);
 	luo_flb_unregister_all(fh);
 	list_del(&ACCESS_PRIVATE(fh, list));
-
-	module_put(fh->ops->owner);
 }
