@@ -57,9 +57,10 @@
  *   - compatible: "luo-session-v1"
  *     Identifies the session ABI version.
  *   - luo-session-header: u64
- *     The physical address of a `struct luo_session_header_ser`. This structure
- *     is the header for a contiguous block of memory containing an array of
- *     `struct luo_session_ser`, one for each preserved session.
+ *     The physical address of the first `struct luo_session_header_ser`.
+ *     This structure is the header for a block of memory containing an array
+ *     of `struct luo_session_ser` entries. Multiple blocks are linked via
+ *     the `next` field in the header.
  *
  * File-Lifecycle-Bound Node (luo-flb):
  *   This node describes all preserved global objects whose lifecycle is bound
@@ -77,9 +78,9 @@
  *   `__packed` structures. These structures contain the actual preserved state.
  *
  *   - struct luo_session_header_ser:
- *     Header for the session array. Contains the total page count of the
- *     preserved memory block and the number of `struct luo_session_ser`
- *     entries that follow.
+ *     Header for the session data block. Contains the physical address of the
+ *     next session data block and the number of `struct luo_session_ser`
+ *     entries that follow this header in the current block.
  *
  *   - struct luo_session_ser:
  *     Metadata for a single session, including its name and a physical pointer
@@ -153,21 +154,23 @@ struct luo_file_set_ser {
  *                          luo_session_header_ser
  */
 #define LUO_FDT_SESSION_NODE_NAME	"luo-session"
-#define LUO_FDT_SESSION_COMPATIBLE	"luo-session-v2"
+#define LUO_FDT_SESSION_COMPATIBLE	"luo-session-v3"
 #define LUO_FDT_SESSION_HEADER		"luo-session-header"
 
 /**
  * struct luo_session_header_ser - Header for the serialized session data block.
+ * @next:  Physical address of the next struct luo_session_header_ser.
  * @count: The number of `struct luo_session_ser` entries that immediately
  *         follow this header in the memory block.
  *
- * This structure is located at the beginning of a contiguous block of
+ * This structure is located at the beginning of a block of
  * physical memory preserved across the kexec. It provides the necessary
  * metadata to interpret the array of session entries that follow.
  *
  * If this structure is modified, `LUO_FDT_SESSION_COMPATIBLE` must be updated.
  */
 struct luo_session_header_ser {
+	u64 next;
 	u64 count;
 } __packed;
 

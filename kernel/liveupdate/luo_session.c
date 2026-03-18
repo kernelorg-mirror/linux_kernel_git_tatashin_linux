@@ -69,30 +69,39 @@
 #include <uapi/linux/liveupdate.h>
 #include "luo_internal.h"
 
-/* 16 4K pages, give space for 744 sessions */
+/* 16 4K pages, give space for 819 sessions per block */
 #define LUO_SESSION_PGCNT	16ul
-#define LUO_SESSION_MAX		(((LUO_SESSION_PGCNT << PAGE_SHIFT) -	\
+#define LUO_SESSION_BLOCK_MAX		(((LUO_SESSION_PGCNT << PAGE_SHIFT) -	\
 		sizeof(struct luo_session_header_ser)) /		\
 		sizeof(struct luo_session_ser))
 
 /**
+ * struct luo_session_block - Internal representation of a session serialization block.
+ * @list: List head for linking blocks in memory.
+ * @ser:  Pointer to the serialized header in preserved memory.
+ */
+struct luo_session_block {
+	struct list_head list;
+	struct luo_session_header_ser *ser;
+};
+
+/**
  * struct luo_session_header - Header struct for managing LUO sessions.
  * @count:      The number of sessions currently tracked in the @list.
+ * @nblocks:    The number of allocated serialization blocks.
  * @list:       The head of the linked list of `struct luo_session` instances.
  * @rwsem:      A read-write semaphore providing synchronized access to the
  *              session list and other fields in this structure.
- * @header_ser: The header data of serialization array.
- * @ser:        The serialized session data (an array of
- *              `struct luo_session_ser`).
+ * @blocks:     The list of serialization blocks (struct luo_session_block).
  * @active:     Set to true when first initialized. If previous kernel did not
  *              send session data, active stays false for incoming.
  */
 struct luo_session_header {
 	long count;
+	long nblocks;
 	struct list_head list;
 	struct rw_semaphore rwsem;
-	struct luo_session_header_ser *header_ser;
-	struct luo_session_ser *ser;
+	struct list_head blocks;
 	bool active;
 };
 
@@ -110,10 +119,12 @@ static struct luo_session_global luo_session_global = {
 	.incoming = {
 		.list = LIST_HEAD_INIT(luo_session_global.incoming.list),
 		.rwsem = __RWSEM_INITIALIZER(luo_session_global.incoming.rwsem),
+		.blocks = LIST_HEAD_INIT(luo_session_global.incoming.blocks),
 	},
 	.outgoing = {
 		.list = LIST_HEAD_INIT(luo_session_global.outgoing.list),
 		.rwsem = __RWSEM_INITIALIZER(luo_session_global.outgoing.rwsem),
+		.blocks = LIST_HEAD_INIT(luo_session_global.outgoing.blocks),
 	},
 };
 
@@ -140,21 +151,76 @@ static void luo_session_free(struct luo_session *session)
 	kfree(session);
 }
 
+static int luo_session_add_block(struct luo_session_header *sh,
+				 struct luo_session_header_ser *ser)
+{
+	struct luo_session_block *block;
+
+	if (sh->nblocks >= LUO_MAX_BLOCKS)
+		return -ENOSPC;
+
+	block = kzalloc_obj(*block);
+	if (!block)
+		return -ENOMEM;
+
+	block->ser = ser;
+	list_add_tail(&block->list, &sh->blocks);
+	sh->nblocks++;
+
+	return 0;
+}
+
+static int luo_session_create_ser_block(struct luo_session_header *sh)
+{
+	struct luo_session_block *last = NULL;
+	struct luo_session_header_ser *ser;
+	int err;
+
+	ser = kho_alloc_preserve(LUO_SESSION_PGCNT << PAGE_SHIFT);
+	if (IS_ERR(ser))
+		return PTR_ERR(ser);
+
+	if (!list_empty(&sh->blocks))
+		last = list_last_entry(&sh->blocks, struct luo_session_block, list);
+
+	err = luo_session_add_block(sh, ser);
+	if (err)
+		goto err_unpreserve;
+
+	if (last)
+		last->ser->next = virt_to_phys(ser);
+
+	return 0;
+
+err_unpreserve:
+	kho_unpreserve_free(ser);
+	return err;
+}
+
+static void luo_session_destroy_ser_blocks(struct luo_session_header *sh,
+					   bool unpreserve)
+{
+	struct luo_session_block *block, *tmp;
+
+	list_for_each_entry_safe(block, tmp, &sh->blocks, list) {
+		if (block->ser) {
+			if (unpreserve)
+				kho_unpreserve_free(block->ser);
+			else
+				kho_restore_free(block->ser);
+		}
+		list_del(&block->list);
+		kfree(block);
+		sh->nblocks--;
+	}
+}
+
 static int luo_session_insert(struct luo_session_header *sh,
 			      struct luo_session *session)
 {
 	struct luo_session *it;
 
 	guard(rwsem_write)(&sh->rwsem);
-
-	/*
-	 * For outgoing we should make sure there is room in serialization array
-	 * for new session.
-	 */
-	if (sh == &luo_session_global.outgoing) {
-		if (sh->count == LUO_SESSION_MAX)
-			return -ENOMEM;
-	}
 
 	/*
 	 * For small number of sessions this loop won't hurt performance
@@ -166,6 +232,20 @@ static int luo_session_insert(struct luo_session_header *sh,
 		if (!strncmp(it->name, session->name, sizeof(it->name)))
 			return -EEXIST;
 	}
+
+	/*
+	 * For outgoing we should make sure there is room in serialization array
+	 * for new session. If not, allocate a new block.
+	 */
+	if (sh == &luo_session_global.outgoing) {
+		if (sh->count == sh->nblocks * LUO_SESSION_BLOCK_MAX) {
+			int err = luo_session_create_ser_block(sh);
+
+			if (err)
+				return err;
+		}
+	}
+
 	list_add_tail(&session->list, &sh->list);
 	sh->count++;
 
@@ -444,9 +524,12 @@ int __init luo_session_setup_outgoing(void *fdt_out)
 	u64 header_ser_pa;
 	int err;
 
-	header_ser = kho_alloc_preserve(LUO_SESSION_PGCNT << PAGE_SHIFT);
-	if (IS_ERR(header_ser))
-		return PTR_ERR(header_ser);
+	err = luo_session_create_ser_block(&luo_session_global.outgoing);
+	if (err)
+		return err;
+
+	header_ser = list_first_entry(&luo_session_global.outgoing.blocks,
+				      struct luo_session_block, list)->ser;
 	header_ser_pa = virt_to_phys(header_ser);
 
 	err = fdt_begin_node(fdt_out, LUO_FDT_SESSION_NODE_NAME);
@@ -459,19 +542,18 @@ int __init luo_session_setup_outgoing(void *fdt_out)
 	if (err)
 		goto err_unpreserve;
 
-	luo_session_global.outgoing.header_ser = header_ser;
-	luo_session_global.outgoing.ser = (void *)(header_ser + 1);
 	luo_session_global.outgoing.active = true;
 
 	return 0;
 
 err_unpreserve:
-	kho_unpreserve_free(header_ser);
+	luo_session_destroy_ser_blocks(&luo_session_global.outgoing, true);
 	return err;
 }
 
 int __init luo_session_setup_incoming(void *fdt_in)
 {
+	struct luo_session_header *sh = &luo_session_global.incoming;
 	struct luo_session_header_ser *header_ser;
 	int err, header_size, offset;
 	u64 header_ser_pa;
@@ -501,11 +583,14 @@ int __init luo_session_setup_incoming(void *fdt_in)
 	}
 
 	header_ser_pa = get_unaligned((u64 *)ptr);
-	header_ser = phys_to_virt(header_ser_pa);
-
-	luo_session_global.incoming.header_ser = header_ser;
-	luo_session_global.incoming.ser = (void *)(header_ser + 1);
-	luo_session_global.incoming.active = true;
+	while (header_ser_pa) {
+		header_ser = phys_to_virt(header_ser_pa);
+		err = luo_session_add_block(sh, header_ser);
+		if (err)
+			return err;
+		header_ser_pa = header_ser->next;
+	}
+	sh->active = true;
 
 	return 0;
 }
@@ -513,6 +598,7 @@ int __init luo_session_setup_incoming(void *fdt_in)
 int luo_session_deserialize(void)
 {
 	struct luo_session_header *sh = &luo_session_global.incoming;
+	struct luo_session_block *block;
 	static bool is_deserialized;
 	static int err;
 
@@ -539,40 +625,49 @@ int luo_session_deserialize(void)
 	 * userspace to detect the failure and trigger a reboot, which will
 	 * reliably reset devices and reclaim memory.
 	 */
-	for (int i = 0; i < sh->header_ser->count; i++) {
-		struct luo_session *session;
+	list_for_each_entry(block, &sh->blocks, list) {
+		struct luo_session_ser *ser = (void *)(block->ser + 1);
 
-		session = luo_session_alloc(sh->ser[i].name);
-		if (IS_ERR(session)) {
-			pr_warn("Failed to allocate session [%.*s] during deserialization %pe\n",
-				(int)sizeof(sh->ser[i].name),
-				sh->ser[i].name, session);
-			err = PTR_ERR(session);
+		if (block->ser->count > LUO_SESSION_BLOCK_MAX) {
+			pr_warn("Session block contains too many entries: %llu\n",
+				block->ser->count);
+			err = -EINVAL;
 			return err;
 		}
 
-		err = luo_session_insert(sh, session);
-		if (err) {
-			pr_warn("Failed to insert session [%s] %pe\n",
-				session->name, ERR_PTR(err));
-			luo_session_free(session);
-			return err;
-		}
+		for (int i = 0; i < block->ser->count; i++) {
+			struct luo_session *session;
 
-		scoped_guard(mutex, &session->mutex) {
-			err = luo_file_deserialize(&session->file_set,
-						   &sh->ser[i].file_set_ser);
-		}
-		if (err) {
-			pr_warn("Failed to deserialize files for session [%s] %pe\n",
-				session->name, ERR_PTR(err));
-			return err;
+			session = luo_session_alloc(ser[i].name);
+			if (IS_ERR(session)) {
+				pr_warn("Failed to allocate session [%.*s] during deserialization %pe\n",
+					(int)sizeof(ser[i].name),
+					ser[i].name, session);
+				err = PTR_ERR(session);
+				return err;
+			}
+
+			err = luo_session_insert(sh, session);
+			if (err) {
+				pr_warn("Failed to insert session [%s] %pe\n",
+					session->name, ERR_PTR(err));
+				luo_session_free(session);
+				return err;
+			}
+
+			scoped_guard(mutex, &session->mutex) {
+				err = luo_file_deserialize(&session->file_set,
+							   &ser[i].file_set_ser);
+			}
+			if (err) {
+				pr_warn("Failed to deserialize files for session [%s] %pe\n",
+					session->name, ERR_PTR(err));
+				return err;
+			}
 		}
 	}
 
-	kho_restore_free(sh->header_ser);
-	sh->header_ser = NULL;
-	sh->ser = NULL;
+	luo_session_destroy_ser_blocks(sh, false);
 
 	return 0;
 }
@@ -580,31 +675,51 @@ int luo_session_deserialize(void)
 int luo_session_serialize(void)
 {
 	struct luo_session_header *sh = &luo_session_global.outgoing;
+	struct luo_session_block *block;
 	struct luo_session *session;
+	struct luo_session_ser *ser;
 	int i = 0;
 	int err;
 
 	guard(rwsem_write)(&sh->rwsem);
+
+	if (list_empty(&sh->blocks))
+		return 0;
+
+	block = list_first_entry(&sh->blocks, struct luo_session_block, list);
+	ser = (void *)(block->ser + 1);
+
 	list_for_each_entry(session, &sh->list, list) {
-		err = luo_session_freeze_one(session, &sh->ser[i]);
+		if (i == LUO_SESSION_BLOCK_MAX) {
+			block->ser->count = i;
+			block = list_next_entry(block, list);
+			ser = (void *)(block->ser + 1);
+			i = 0;
+		}
+
+		err = luo_session_freeze_one(session, &ser[i]);
 		if (err)
 			goto err_undo;
 
-		strscpy(sh->ser[i].name, session->name,
-			sizeof(sh->ser[i].name));
+		strscpy(ser[i].name, session->name,
+			sizeof(ser[i].name));
 		i++;
 	}
-	sh->header_ser->count = sh->count;
+	block->ser->count = i;
 
 	return 0;
 
 err_undo:
 	list_for_each_entry_continue_reverse(session, &sh->list, list) {
 		i--;
-		luo_session_unfreeze_one(session, &sh->ser[i]);
-		memset(sh->ser[i].name, 0, sizeof(sh->ser[i].name));
+		if (i < 0) {
+			block = list_prev_entry(block, list);
+			ser = (void *)(block->ser + 1);
+			i = LUO_SESSION_BLOCK_MAX - 1;
+		}
+		luo_session_unfreeze_one(session, &ser[i]);
+		memset(ser[i].name, 0, sizeof(ser[i].name));
 	}
 
 	return err;
 }
-
