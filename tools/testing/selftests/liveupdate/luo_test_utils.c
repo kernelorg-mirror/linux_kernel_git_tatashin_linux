@@ -20,12 +20,37 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <stdarg.h>
+#include <sys/resource.h>
 
 #include "luo_test_utils.h"
 
 int luo_open_device(void)
 {
 	return open(LUO_DEVICE, O_RDWR);
+}
+
+void luo_ensure_nofile_limit(long min_limit)
+{
+	struct rlimit hl;
+
+	if (getrlimit(RLIMIT_NOFILE, &hl) < 0)
+		ksft_exit_fail_msg("getrlimit failed: %s\n", strerror(errno));
+
+	if (hl.rlim_cur >= min_limit)
+		return;
+
+	hl.rlim_cur = min_limit;
+	if (hl.rlim_cur > hl.rlim_max)
+		hl.rlim_max = hl.rlim_cur;
+
+	if (setrlimit(RLIMIT_NOFILE, &hl) < 0) {
+		if (errno == EPERM) {
+			ksft_exit_skip("Insufficient privileges to set RLIMIT_NOFILE to %ld\n",
+				       hl.rlim_cur);
+		}
+		ksft_exit_fail_msg("setrlimit to %ld failed: %s\n",
+				   hl.rlim_cur, strerror(errno));
+	}
 }
 
 int luo_create_session(int luo_fd, const char *name)
