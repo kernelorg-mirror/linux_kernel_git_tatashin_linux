@@ -475,16 +475,21 @@ int liveupdate_register_flb(struct liveupdate_file_handler *fh,
  * owner module (acquired during registration) is released.
  *
  * Context: It is typically called from a subsystem's module exit function.
+ * Return: 0 on success.
+ *         -EOPNOTSUPP if live update is disabled.
+ *         -ENOENT if the FLB was not found in the file handler's list.
  */
-void liveupdate_unregister_flb(struct liveupdate_file_handler *fh,
-			       struct liveupdate_flb *flb)
+int liveupdate_unregister_flb(struct liveupdate_file_handler *fh,
+			      struct liveupdate_flb *flb)
 {
 	if (!liveupdate_enabled())
-		return;
+		return -EOPNOTSUPP;
 
 	guard(rwsem_write)(&luo_register_rwlock);
 
 	luo_flb_unregister_one(fh, flb);
+
+	return 0;
 }
 
 /**
