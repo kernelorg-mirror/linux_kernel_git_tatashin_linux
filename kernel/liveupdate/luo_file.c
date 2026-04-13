@@ -813,8 +813,7 @@ int luo_file_deserialize(struct luo_file_set *file_set,
 		}
 
 		if (!handler_found) {
-			pr_warn("No registered handler for compatible '%.*s'\n",
-				(int)sizeof(file_ser[i].compatible),
+			pr_warn("No registered handler for compatible '%s'\n",
 				file_ser[i].compatible);
 			return -ENOENT;
 		}
