@@ -89,18 +89,13 @@ struct luo_flb_link {
 static struct luo_flb_private *luo_flb_get_private(struct liveupdate_flb *flb)
 {
 	struct luo_flb_private *private = &ACCESS_PRIVATE(flb, private);
-	static DEFINE_SPINLOCK(luo_flb_init_lock);
 
-	if (smp_load_acquire(&private->initialized))
-		return private;
-
-	guard(spinlock)(&luo_flb_init_lock);
 	if (!private->initialized) {
 		mutex_init(&private->incoming.lock);
 		mutex_init(&private->outgoing.lock);
 		INIT_LIST_HEAD(&private->list);
 		private->users = 0;
-		smp_store_release(&private->initialized, true);
+		private->initialized = true;
 	}
 
 	return private;
