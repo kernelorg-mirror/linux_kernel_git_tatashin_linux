@@ -51,18 +51,29 @@ static inline int luo_ucmd_respond(struct luo_ucmd *ucmd,
 #define luo_restore_fail(__fmt, ...) panic(__fmt, ##__VA_ARGS__)
 
 /**
+ * struct luo_file_block - Internal representation of a file serialization block.
+ * @list: List head for linking blocks in memory.
+ * @ser:  Pointer to the serialized header in preserved memory.
+ */
+struct luo_file_block {
+	struct list_head list;
+	struct luo_file_header_ser *ser;
+};
+
+/**
  * struct luo_file_set - A set of files that belong to the same sessions.
  * @files_list: An ordered list of files associated with this session, it is
  *              ordered by preservation time.
- * @files:      The physically contiguous memory block that holds the serialized
- *              state of files.
+ * @blocks:     The list of serialization blocks (struct luo_file_block).
  * @count:      A counter tracking the number of files currently stored in the
  *              @files_list for this session.
+ * @nblocks:    The number of allocated serialization blocks.
  */
 struct luo_file_set {
 	struct list_head files_list;
-	struct luo_file_ser *files;
+	struct list_head blocks;
 	long count;
+	long nblocks;
 };
 
 /**

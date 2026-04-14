@@ -119,10 +119,12 @@ static LIST_HEAD(luo_file_handler_list);
 /* Keep track of files being preserved by LUO */
 static DEFINE_XARRAY(luo_preserved_files);
 
-/* 2 4K pages, give space for 128 files per file_set */
+/* 2 4K pages, give space for 127 files per block */
 #define LUO_FILE_PGCNT		2ul
-#define LUO_FILE_MAX							\
-	((LUO_FILE_PGCNT << PAGE_SHIFT) / sizeof(struct luo_file_ser))
+#define LUO_FILE_BLOCK_MAX					\
+	(((LUO_FILE_PGCNT << PAGE_SHIFT) -			\
+	  sizeof(struct luo_file_header_ser)) /			\
+	 sizeof(struct luo_file_ser))
 
 /**
  * struct luo_file - Represents a single preserved file instance.
@@ -158,7 +160,7 @@ static DEFINE_XARRAY(luo_preserved_files);
  * and the serialized state handle returned by the handler's .preserve()
  * operation.
  *
- * These instances are tracked in a per-file_set list. The @serialized_data
+ * These structures are tracked in a per-file_set list. The @serialized_data
  * field, which holds a handle to the file's serialized state, may be updated
  * during the .freeze() callback before being serialized for the next kernel.
  * After reboot, these structures are recreated by luo_file_deserialize() and
@@ -175,37 +177,68 @@ struct luo_file {
 	u64 token;
 };
 
-static int luo_alloc_files_mem(struct luo_file_set *file_set)
+static int luo_file_add_block(struct luo_file_set *file_set,
+			      struct luo_file_header_ser *ser)
 {
-	size_t size;
-	void *mem;
+	struct luo_file_block *block;
 
-	if (file_set->files)
-		return 0;
+	if (file_set->nblocks >= LUO_MAX_BLOCKS)
+		return -ENOSPC;
 
-	WARN_ON_ONCE(file_set->count);
+	block = kzalloc_obj(*block);
+	if (!block)
+		return -ENOMEM;
 
-	size = LUO_FILE_PGCNT << PAGE_SHIFT;
-	mem = kho_alloc_preserve(size);
-	if (IS_ERR(mem))
-		return PTR_ERR(mem);
-
-	file_set->files = mem;
+	block->ser = ser;
+	list_add_tail(&block->list, &file_set->blocks);
+	file_set->nblocks++;
 
 	return 0;
 }
 
-static void luo_free_files_mem(struct luo_file_set *file_set)
+static int luo_file_create_ser_block(struct luo_file_set *file_set)
 {
-	/* If file_set has files, no need to free preservation memory */
-	if (file_set->count)
-		return;
+	struct luo_file_block *last = NULL;
+	struct luo_file_header_ser *ser;
+	int err;
 
-	if (!file_set->files)
-		return;
+	ser = kho_alloc_preserve(LUO_FILE_PGCNT << PAGE_SHIFT);
+	if (IS_ERR(ser))
+		return PTR_ERR(ser);
 
-	kho_unpreserve_free(file_set->files);
-	file_set->files = NULL;
+	if (!list_empty(&file_set->blocks))
+		last = list_last_entry(&file_set->blocks, struct luo_file_block, list);
+
+	err = luo_file_add_block(file_set, ser);
+	if (err)
+		goto err_unpreserve;
+
+	if (last)
+		last->ser->next = virt_to_phys(ser);
+
+	return 0;
+
+err_unpreserve:
+	kho_unpreserve_free(ser);
+	return err;
+}
+
+static void luo_file_destroy_ser_blocks(struct luo_file_set *file_set,
+					bool unpreserve)
+{
+	struct luo_file_block *block, *tmp;
+
+	list_for_each_entry_safe(block, tmp, &file_set->blocks, list) {
+		if (block->ser) {
+			if (unpreserve)
+				kho_unpreserve_free(block->ser);
+			else
+				kho_restore_free(block->ser);
+		}
+		list_del(&block->list);
+		kfree(block);
+		file_set->nblocks--;
+	}
 }
 
 static unsigned long luo_get_id(struct liveupdate_file_handler *fh,
@@ -247,7 +280,9 @@ static bool luo_token_is_used(struct luo_file_set *file_set, u64 token)
  * 3. Iterates through registered handlers, calling can_preserve() to find one
  *    compatible with the given @fd.
  * 4. Calls the handler's .preserve() operation, which saves the file's state
- *    and returns an opaque private data handle.
+ *    and returns an opaque u64 handle. This is typically performed while the
+ *    workload is still active to minimize the downtime during the
+ *    actual reboot transition.
  * 5. Adds the new instance to the file_set's internal list.
  *
  * On success, LUO takes a reference to the 'struct file' and considers it
@@ -277,16 +312,15 @@ int luo_preserve_file(struct luo_file_set *file_set, u64 token, int fd)
 	if (luo_token_is_used(file_set, token))
 		return -EEXIST;
 
-	if (file_set->count == LUO_FILE_MAX)
-		return -ENOSPC;
+	if (file_set->count == file_set->nblocks * LUO_FILE_BLOCK_MAX) {
+		err = luo_file_create_ser_block(file_set);
+		if (err)
+			return err;
+	}
 
 	file = fget(fd);
 	if (!file)
 		return -EBADF;
-
-	err = luo_alloc_files_mem(file_set);
-	if (err)
-		goto  err_fput;
 
 	err = -ENOENT;
 	down_read(&luo_register_rwlock);
@@ -301,7 +335,7 @@ int luo_preserve_file(struct luo_file_set *file_set, u64 token, int fd)
 
 	/* err is still -ENOENT if no handler was found */
 	if (err)
-		goto err_free_files_mem;
+		goto err_fput;
 
 	/* safe to use fh because its module is pinned */
 	err = xa_insert(&luo_preserved_files, luo_get_id(fh, file),
@@ -345,8 +379,6 @@ err_erase_xa:
 	xa_erase(&luo_preserved_files, luo_get_id(fh, file));
 err_module_put:
 	module_put(fh->ops->owner);
-err_free_files_mem:
-	luo_free_files_mem(file_set);
 err_fput:
 	fput(file);
 
@@ -399,7 +431,7 @@ void luo_file_unpreserve_files(struct luo_file_set *file_set)
 		kfree(luo_file);
 	}
 
-	luo_free_files_mem(file_set);
+	luo_file_destroy_ser_blocks(file_set, true);
 }
 
 static int luo_file_freeze_one(struct luo_file_set *file_set,
@@ -446,6 +478,7 @@ static void __luo_file_unfreeze(struct luo_file_set *file_set,
 				struct luo_file *failed_entry)
 {
 	struct list_head *files_list = &file_set->files_list;
+	struct luo_file_block *block;
 	struct luo_file *luo_file;
 
 	list_for_each_entry(luo_file, files_list, list) {
@@ -455,7 +488,11 @@ static void __luo_file_unfreeze(struct luo_file_set *file_set,
 		luo_file_unfreeze_one(file_set, luo_file);
 	}
 
-	memset(file_set->files, 0, LUO_FILE_PGCNT << PAGE_SHIFT);
+	list_for_each_entry(block, &file_set->blocks, list) {
+		block->ser->count = 0;
+		memset(block->ser + 1, 0,
+		       (LUO_FILE_PGCNT << PAGE_SHIFT) - sizeof(*block->ser));
+	}
 }
 
 /**
@@ -494,7 +531,8 @@ static void __luo_file_unfreeze(struct luo_file_set *file_set,
 int luo_file_freeze(struct luo_file_set *file_set,
 		    struct luo_file_set_ser *file_set_ser)
 {
-	struct luo_file_ser *file_ser = file_set->files;
+	struct luo_file_block *block;
+	struct luo_file_ser *file_ser;
 	struct luo_file *luo_file;
 	int err;
 	int i;
@@ -502,11 +540,18 @@ int luo_file_freeze(struct luo_file_set *file_set,
 	if (!file_set->count)
 		return 0;
 
-	if (WARN_ON(!file_ser))
-		return -EINVAL;
+	block = list_first_entry(&file_set->blocks, struct luo_file_block, list);
+	file_ser = (void *)(block->ser + 1);
 
 	i = 0;
 	list_for_each_entry(luo_file, &file_set->files_list, list) {
+		if (i == LUO_FILE_BLOCK_MAX) {
+			block->ser->count = i;
+			block = list_next_entry(block, list);
+			file_ser = (void *)(block->ser + 1);
+			i = 0;
+		}
+
 		err = luo_file_freeze_one(file_set, luo_file);
 		if (err < 0) {
 			pr_warn("Freeze failed for token[%#0llx] handler[%s] err[%pe]\n",
@@ -521,10 +566,13 @@ int luo_file_freeze(struct luo_file_set *file_set,
 		file_ser[i].token = luo_file->token;
 		i++;
 	}
+	block->ser->count = i;
 
 	file_set_ser->count = file_set->count;
-	if (file_set->files)
-		file_set_ser->files = virt_to_phys(file_set->files);
+	if (!list_empty(&file_set->blocks)) {
+		block = list_first_entry(&file_set->blocks, struct luo_file_block, list);
+		file_set_ser->files = virt_to_phys(block->ser);
+	}
 
 	return 0;
 
@@ -746,10 +794,7 @@ int luo_file_finish(struct luo_file_set *file_set)
 		kfree(luo_file);
 	}
 
-	if (file_set->files) {
-		kho_restore_free(file_set->files);
-		file_set->files = NULL;
-	}
+	luo_file_destroy_ser_blocks(file_set, false);
 
 	return 0;
 }
@@ -782,8 +827,10 @@ int luo_file_finish(struct luo_file_set *file_set)
 int luo_file_deserialize(struct luo_file_set *file_set,
 			 struct luo_file_set_ser *file_set_ser)
 {
-	struct luo_file_ser *file_ser;
-	u64 i;
+	struct luo_file_header_ser *header_ser;
+	struct luo_file_block *block;
+	u64 header_ser_pa;
+	int err;
 
 	if (!file_set_ser->files) {
 		WARN_ON(file_set_ser->count);
@@ -791,7 +838,15 @@ int luo_file_deserialize(struct luo_file_set *file_set,
 	}
 
 	file_set->count = file_set_ser->count;
-	file_set->files = phys_to_virt(file_set_ser->files);
+	header_ser_pa = file_set_ser->files;
+
+	while (header_ser_pa) {
+		header_ser = phys_to_virt(header_ser_pa);
+		err = luo_file_add_block(file_set, header_ser);
+		if (err)
+			return err;
+		header_ser_pa = header_ser->next;
+	}
 
 	/*
 	 * Note on error handling:
@@ -808,42 +863,51 @@ int luo_file_deserialize(struct luo_file_set *file_set,
 	 * userspace to detect the failure and trigger a reboot, which will
 	 * reliably reset devices and reclaim memory.
 	 */
-	file_ser = file_set->files;
-	for (i = 0; i < file_set->count; i++) {
-		struct liveupdate_file_handler *fh;
-		bool handler_found = false;
-		struct luo_file *luo_file;
+	list_for_each_entry(block, &file_set->blocks, list) {
+		struct luo_file_ser *file_ser = (void *)(block->ser + 1);
 
-		down_read(&luo_register_rwlock);
-		list_private_for_each_entry(fh, &luo_file_handler_list, list) {
-			if (!strcmp(fh->compatible, file_ser[i].compatible)) {
-				if (try_module_get(fh->ops->owner))
-					handler_found = true;
-				break;
+		if (block->ser->count > LUO_FILE_BLOCK_MAX) {
+			pr_warn("File block contains too many entries: %llu\n",
+				block->ser->count);
+			return -EINVAL;
+		}
+
+		for (int i = 0; i < block->ser->count; i++) {
+			struct liveupdate_file_handler *fh;
+			bool handler_found = false;
+			struct luo_file *luo_file;
+
+			down_read(&luo_register_rwlock);
+			list_private_for_each_entry(fh, &luo_file_handler_list, list) {
+				if (!strcmp(fh->compatible, file_ser[i].compatible)) {
+					if (try_module_get(fh->ops->owner))
+						handler_found = true;
+					break;
+				}
 			}
-		}
-		up_read(&luo_register_rwlock);
+			up_read(&luo_register_rwlock);
 
-		if (!handler_found) {
-			pr_warn("No registered handler for compatible '%.*s'\n",
-				(int)sizeof(file_ser[i].compatible),
-				file_ser[i].compatible);
-			return -ENOENT;
-		}
+			if (!handler_found) {
+				pr_warn("No registered handler for compatible '%.*s'\n",
+					(int)sizeof(file_ser[i].compatible),
+					file_ser[i].compatible);
+				return -ENOENT;
+			}
 
-		luo_file = kzalloc_obj(*luo_file);
-		if (!luo_file) {
-			module_put(fh->ops->owner);
-			return -ENOMEM;
-		}
+			luo_file = kzalloc_obj(*luo_file);
+			if (!luo_file) {
+				module_put(fh->ops->owner);
+				return -ENOMEM;
+			}
 
-		/* safe to use fh because its module is pinned */
-		luo_file->fh = fh;
-		luo_file->file = NULL;
-		luo_file->serialized_data = file_ser[i].data;
-		luo_file->token = file_ser[i].token;
-		mutex_init(&luo_file->mutex);
-		list_add_tail(&luo_file->list, &file_set->files_list);
+			/* safe to use fh because its module is pinned */
+			luo_file->fh = fh;
+			luo_file->file = NULL;
+			luo_file->serialized_data = file_ser[i].data;
+			luo_file->token = file_ser[i].token;
+			mutex_init(&luo_file->mutex);
+			list_add_tail(&luo_file->list, &file_set->files_list);
+		}
 	}
 
 	return 0;
@@ -852,12 +916,14 @@ int luo_file_deserialize(struct luo_file_set *file_set,
 void luo_file_set_init(struct luo_file_set *file_set)
 {
 	INIT_LIST_HEAD(&file_set->files_list);
+	INIT_LIST_HEAD(&file_set->blocks);
 }
 
 void luo_file_set_destroy(struct luo_file_set *file_set)
 {
 	WARN_ON(file_set->count);
 	WARN_ON(!list_empty(&file_set->files_list));
+	WARN_ON(!list_empty(&file_set->blocks));
 }
 
 /**

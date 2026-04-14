@@ -84,8 +84,13 @@
  *
  *   - struct luo_session_ser:
  *     Metadata for a single session, including its name and a physical pointer
- *     to another preserved memory block containing an array of
- *     `struct luo_file_ser` for all files in that session.
+ *     to the first `struct luo_file_header_ser` for all files in that session.
+ *     Multiple blocks are linked via the `next` field in the header.
+ *
+ *   - struct luo_file_header_ser:
+ *     Header for the file data block. Contains the physical address of the
+ *     next file data block and the number of `struct luo_file_ser` entries
+ *     that follow this header in the current block.
  *
  *   - struct luo_file_ser:
  *     Metadata for a single preserved file. Contains the `compatible` string to
@@ -135,10 +140,28 @@ struct luo_file_ser {
 } __packed;
 
 /**
+ * struct luo_file_header_ser - Header for the serialized file data block.
+ * @next:  Physical address of the next struct luo_file_header_ser.
+ * @count: The number of `struct luo_file_ser` entries that immediately
+ *         follow this header in the memory block.
+ *
+ * This structure is located at the beginning of a block of
+ * physical memory preserved across the kexec. It provides the necessary
+ * metadata to interpret the array of file entries that follow.
+ *
+ * If this structure is modified, `LUO_FDT_SESSION_COMPATIBLE` must be updated.
+ */
+struct luo_file_header_ser {
+	u64 next;
+	u64 count;
+} __packed;
+
+/**
  * struct luo_file_set_ser - Represents the serialized metadata for file set
- * @files:   The physical address of a contiguous memory block that holds
- *           the serialized state of files (array of luo_file_ser) in this file
- *           set.
+ * @files:   The physical address of the first `struct luo_file_header_ser`.
+ *           This structure is the header for a block of memory containing
+ *           an array of `struct luo_file_ser` entries. Multiple blocks are
+ *           linked via the `next` field in the header.
  * @count:   The total number of files that were part of this session during
  *           serialization. Used for iteration and validation during
  *           restoration.
@@ -154,7 +177,7 @@ struct luo_file_set_ser {
  *                          luo_session_header_ser
  */
 #define LUO_FDT_SESSION_NODE_NAME	"luo-session"
-#define LUO_FDT_SESSION_COMPATIBLE	"luo-session-v3"
+#define LUO_FDT_SESSION_COMPATIBLE	"luo-session-v4"
 #define LUO_FDT_SESSION_HEADER		"luo-session-header"
 
 /**
