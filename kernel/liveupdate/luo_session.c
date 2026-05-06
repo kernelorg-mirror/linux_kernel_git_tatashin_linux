@@ -46,6 +46,38 @@
  * 4.  Retrieval: A userspace agent in the new kernel can then call
  *     `luo_session_retrieve()` with a session name to get a new file
  *     descriptor and access the preserved state.
+ *
+ * Locking:
+ *
+ * The LUO session subsystem uses a three-tier locking hierarchy to ensure thread
+ * safety and prevent deadlocks during concurrent session mutations and kexec
+ * serialization:
+ *
+ * 1. `luo_session_serialize_rwsem` (global rwsem):
+ *    Protects session mutations (creation, retrieval, release, and ioctls)
+ *    against the serialization process during reboot.
+ *
+ *    - Readers: Taken by any path modifying or accessing session state (e.g.,
+ *      `luo_session_create()`, `luo_session_retrieve()`, `luo_session_release()`,
+ *      and `luo_session_ioctl()`).
+ *    - Writer: Taken by the serialization process (`luo_session_serialize()`)
+ *      during reboot. On success, the write lock is held indefinitely to freeze
+ *      the subsystem. On failure, it is released to allow recovery.
+ *
+ * 2. `luo_session_header->rwsem` (per-list rwsem):
+ *    Synchronizes list-level operations for the incoming and outgoing session headers.
+ *
+ *    - Writer: Taken during list mutation operations (inserting or removing a
+ *      session from the list).
+ *    - Reader: Taken when traversing the list (e.g., retrieving a session by name).
+ *
+ * 3. `luo_session->mutex` (per-session mutex):
+ *    Protects the internal state and file sets of an individual session. It is
+ *    acquired during per-session operations such as preserving, retrieving,
+ *    or freezing files.
+ *
+ * Lock Hierarchy:
+ *   `luo_session_serialize_rwsem` -> `luo_session_header->rwsem` -> `luo_session->mutex`
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -74,6 +106,13 @@
 #define LUO_SESSION_MAX		(((LUO_SESSION_PGCNT << PAGE_SHIFT) -	\
 		sizeof(struct luo_session_header_ser)) /		\
 		sizeof(struct luo_session_ser))
+
+/*
+ * Protects session mutations during serialization. All session mutation
+ * operations must hold the read lock. The serialization process holds the write
+ * lock indefinitely on success to block all concurrent and future mutations.
+ */
+static DECLARE_RWSEM(luo_session_serialize_rwsem);
 
 /**
  * struct luo_session_header - Header struct for managing LUO sessions.
@@ -205,6 +244,7 @@ static int luo_session_release(struct inode *inodep, struct file *filep)
 	struct luo_session *session = filep->private_data;
 	struct luo_session_header *sh;
 
+	guard(rwsem_read)(&luo_session_serialize_rwsem);
 	/* If retrieved is set, it means this session is from incoming list */
 	if (session->retrieved) {
 		int err = luo_session_finish_one(session);
@@ -382,6 +422,7 @@ static long luo_session_ioctl(struct file *filep, unsigned int cmd,
 	if (ret)
 		return ret;
 
+	guard(rwsem_read)(&luo_session_serialize_rwsem);
 	return op->execute(session, &ucmd);
 }
 
@@ -417,14 +458,17 @@ int luo_session_create(const char *name, struct file **filep)
 	if (IS_ERR(session))
 		return PTR_ERR(session);
 
+	down_read(&luo_session_serialize_rwsem);
 	err = luo_session_insert(&luo_session_global.outgoing, session);
 	if (err)
 		goto err_free;
 
-	scoped_guard(mutex, &session->mutex)
-		err = luo_session_getfile(session, filep);
+	mutex_lock(&session->mutex);
+	err = luo_session_getfile(session, filep);
+	mutex_unlock(&session->mutex);
 	if (err)
 		goto err_remove;
+	up_read(&luo_session_serialize_rwsem);
 
 	return 0;
 
@@ -432,6 +476,7 @@ err_remove:
 	luo_session_remove(&luo_session_global.outgoing, session);
 err_free:
 	luo_session_free(session);
+	up_read(&luo_session_serialize_rwsem);
 
 	return err;
 }
@@ -443,6 +488,7 @@ int luo_session_retrieve(const char *name, struct file **filep)
 	struct luo_session *it;
 	int err;
 
+	guard(rwsem_read)(&luo_session_serialize_rwsem);
 	guard(rwsem_read)(&sh->rwsem);
 	list_for_each_entry(it, &sh->list, list) {
 		if (!strncmp(it->name, name, sizeof(it->name))) {
@@ -615,7 +661,8 @@ int luo_session_serialize(void)
 	int i = 0;
 	int err;
 
-	guard(rwsem_write)(&sh->rwsem);
+	down_write(&luo_session_serialize_rwsem);
+	down_write(&sh->rwsem);
 	list_for_each_entry(session, &sh->list, list) {
 		err = luo_session_freeze_one(session, &sh->ser[i]);
 		if (err)
@@ -626,6 +673,7 @@ int luo_session_serialize(void)
 		i++;
 	}
 	sh->header_ser->count = sh->count;
+	up_write(&sh->rwsem);
 
 	return 0;
 
@@ -635,6 +683,8 @@ err_undo:
 		luo_session_unfreeze_one(session, &sh->ser[i]);
 		memset(sh->ser[i].name, 0, sizeof(sh->ser[i].name));
 	}
+	up_write(&sh->rwsem);
+	up_write(&luo_session_serialize_rwsem);
 
 	return err;
 }
