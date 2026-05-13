@@ -36,7 +36,7 @@
  *
  * Main LUO Node (/):
  *
- *   - compatible: "luo-v2"
+ *   - compatible: "luo-v3"
  *     Identifies the overall LUO ABI version.
  *   - luo-abi-header: u64
  *     The physical address of `struct luo_ser`.
@@ -53,11 +53,6 @@
  *     Header for the session or file data block. Contains the physical address
  *     of the next data block and the number of entries that follow this
  *     header in the current block.
- *
- *   - struct luo_session_header_ser:
- *     Header for the session array. Contains the total page count of the
- *     preserved memory block and the number of `struct luo_session_ser`
- *     entries that follow.
  *
  *   - struct luo_session_ser:
  *     Metadata for a single session, including its name and a physical pointer
@@ -90,7 +85,7 @@
  */
 #define LUO_FDT_SIZE		PAGE_SIZE
 #define LUO_FDT_KHO_ENTRY_NAME	"LUO"
-#define LUO_FDT_COMPATIBLE	"luo-v2"
+#define LUO_FDT_COMPATIBLE	"luo-v3"
 #define LUO_FDT_ABI_HEADER	"luo-abi-header"
 
 /**
@@ -152,21 +147,6 @@ struct luo_file_ser {
  */
 struct luo_file_set_ser {
 	u64 files;
-	u64 count;
-} __packed;
-
-/**
- * struct luo_session_header_ser - Header for the serialized session data block.
- * @count: The number of `struct luo_session_ser` entries that immediately
- *         follow this header in the memory block.
- *
- * This structure is located at the beginning of a contiguous block of
- * physical memory preserved across the kexec. It provides the necessary
- * metadata to interpret the array of session entries that follow.
- *
- * If this structure is modified, `LUO_FDT_COMPATIBLE` must be updated.
- */
-struct luo_session_header_ser {
 	u64 count;
 } __packed;
 
