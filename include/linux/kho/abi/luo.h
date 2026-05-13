@@ -49,6 +49,11 @@
  *     The central ABI structure that contains the overall state of the LUO.
  *     It includes the liveupdate-number and pointers to sessions and FLBs.
  *
+ *   - struct luo_block_header_ser:
+ *     Header for the session or file data block. Contains the physical address
+ *     of the next data block and the number of entries that follow this
+ *     header in the current block.
+ *
  *   - struct luo_session_header_ser:
  *     Header for the session array. Contains the total page count of the
  *     preserved memory block and the number of `struct luo_session_ser`
@@ -104,6 +109,23 @@ struct luo_ser {
 } __packed;
 
 #define LIVEUPDATE_HNDL_COMPAT_LENGTH	48
+
+/**
+ * struct luo_block_header_ser - Header for the serialized data block.
+ * @next:  Physical address of the next struct luo_block_header_ser.
+ * @count: The number of entries that immediately follow this header in the
+ *         memory block.
+ *
+ * This structure is located at the beginning of a block of
+ * physical memory preserved across the kexec. It provides the necessary
+ * metadata to interpret the array of entries that follow.
+ *
+ * If this structure is modified, `LUO_FDT_COMPATIBLE` must be updated.
+ */
+struct luo_block_header_ser {
+	u64 next;
+	u64 count;
+} __packed;
 
 /**
  * struct luo_file_ser - Represents the serialized preserves files.

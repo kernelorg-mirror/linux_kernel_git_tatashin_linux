@@ -23,6 +23,11 @@ LUO File Lifecycle Bound Global Data
 .. kernel-doc:: kernel/liveupdate/luo_flb.c
    :doc: LUO File Lifecycle Bound Global Data
 
+LUO Serialization Blocks
+========================
+.. kernel-doc:: kernel/liveupdate/luo_block.c
+   :doc: LUO Serialization Blocks
+
 Live Update Orchestrator ABI
 ============================
 .. kernel-doc:: include/linux/kho/abi/luo.h
@@ -63,6 +68,9 @@ Internal API
    :internal:
 
 .. kernel-doc:: kernel/liveupdate/luo_file.c
+   :internal:
+
+.. kernel-doc:: kernel/liveupdate/luo_block.c
    :internal:
 
 See Also

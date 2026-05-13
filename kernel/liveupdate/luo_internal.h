@@ -41,6 +41,51 @@ static inline int luo_ucmd_respond(struct luo_ucmd *ucmd,
 #define luo_restore_fail(__fmt, ...) panic(__fmt, ##__VA_ARGS__)
 
 /**
+ * struct luo_block - Internal representation of a serialization block.
+ * @list: List head for linking blocks in memory.
+ * @ser:  Pointer to the serialized header in preserved memory.
+ */
+struct luo_block {
+	struct list_head list;
+	struct luo_block_header_ser *ser;
+};
+
+/**
+ * struct luo_block_set - A set of blocks that belong to the same object.
+ * @blocks:          The list of serialization blocks (struct luo_block).
+ * @nblocks:         The number of allocated serialization blocks.
+ * @head_pa:         Physical address of the first block header.
+ * @entry_size:      The size of each entry in the blocks.
+ * @count_per_block: The maximum number of entries each block can hold.
+ * @incoming:        True if this block set was restored from the previous kernel.
+ */
+struct luo_block_set {
+	struct list_head blocks;
+	long nblocks;
+	u64 head_pa;
+	size_t entry_size;
+	u64 count_per_block;
+	bool incoming;
+};
+
+/**
+ * struct luo_block_it - Iterator for serializing entries into blocks.
+ * @bs:         The block set being iterated.
+ * @block:      The current block.
+ * @i:          The current entry index within @block.
+ */
+struct luo_block_it {
+	struct luo_block_set *bs;
+	struct luo_block *block;
+	u64 i;
+};
+
+#define LUO_BLOCK_SET_INIT(name, _entry_size) {				\
+	.blocks = LIST_HEAD_INIT((name).blocks),			\
+	.entry_size = _entry_size,					\
+}
+
+/**
  * struct luo_file_set - A set of files that belong to the same sessions.
  * @files_list: An ordered list of files associated with this session, it is
  *              ordered by preservation time.
@@ -99,6 +144,18 @@ int luo_file_deserialize(struct luo_file_set *file_set,
 			 struct luo_file_set_ser *file_set_ser);
 void luo_file_set_init(struct luo_file_set *file_set);
 void luo_file_set_destroy(struct luo_file_set *file_set);
+
+void luo_block_set_init(struct luo_block_set *bs, size_t entry_size);
+int luo_block_grow(struct luo_block_set *bs, u64 count);
+void luo_block_shrink(struct luo_block_set *bs, u64 count);
+int luo_block_restore(struct luo_block_set *bs, u64 head_pa);
+void luo_block_destroy(struct luo_block_set *bs);
+void luo_block_set_clear(struct luo_block_set *bs);
+void luo_block_it_init(struct luo_block_it *it, struct luo_block_set *bs);
+void *luo_block_it_next(struct luo_block_it *it);
+void *luo_block_it_read(struct luo_block_it *it);
+void *luo_block_it_prev(struct luo_block_it *it);
+void luo_block_it_finalize(struct luo_block_it *it);
 
 int luo_flb_file_preserve(struct liveupdate_file_handler *fh);
 void luo_flb_file_unpreserve(struct liveupdate_file_handler *fh);
