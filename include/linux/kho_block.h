@@ -70,6 +70,28 @@ int kho_block_set_restore(struct kho_block_set *bs, u64 head_pa);
 void kho_block_set_destroy(struct kho_block_set *bs);
 void kho_block_set_clear(struct kho_block_set *bs);
 
+/**
+ * kho_block_set_head_pa - Get the physical address of the first block header.
+ * @bs: The block set.
+ *
+ * Return: The physical address of the first block header, or 0 if empty.
+ */
+static inline u64 kho_block_set_head_pa(struct kho_block_set *bs)
+{
+	return bs->head_pa;
+}
+
+/**
+ * kho_block_set_is_empty - Check if the block set has no allocated blocks.
+ * @bs: The block set.
+ *
+ * Return: True if there are no blocks in the set, false otherwise.
+ */
+static inline bool kho_block_set_is_empty(struct kho_block_set *bs)
+{
+	return list_empty(&bs->blocks);
+}
+
 void kho_block_it_init(struct kho_block_it *it, struct kho_block_set *bs);
 void *kho_block_it_reserve_entry(struct kho_block_it *it);
 void *kho_block_it_read_entry(struct kho_block_it *it);
